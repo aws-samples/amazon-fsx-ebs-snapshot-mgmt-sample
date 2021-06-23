@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Snapshot Managment Solution
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: CloudformationParameters
+        Parameters:
+          - SnapManagementSFNName
+          - S3Bucket
+          - SFNTriggerLambdaZipKey
+          - SnapshotManagementLambdaZipKey
+          - LambdaKmsKeyArn
+          - TimeDurationType
+          - TimeDuration
+
+Parameters:
+  SnapManagementSFNName:
+    Type: String
+    Description: Name for the Snapshot Management Step Function
+    Default: SnapshotMgmtSample
+  S3Bucket:
+    Type: String
+    Description: The S3 Bucket that contains the Lambda zip files
+  SFNTriggerLambdaZipKey:
+    Type: String
+    Description: The S3 object path (key) for the Step Function trigger lambda (sfn-trigger)
+  SnapshotManagementLambdaZipKey:
+    Type: String
+    Description: The S3 object path (key) for the Snapshot Management lambda (snap-manager)
+  LambdaKmsKeyArn:
+    Type: String
+    Description: ARN of the KMS key used to encrypt lambda environment variables
+  TimeDurationType:
+    Type: String
+    Description: Type of time duration to use for Snapshot cleanup. Refer to python datetime.timedelta
+    AllowedValues:
+      - days
+      - seconds
+      - microseconds
+      - milliseconds
+      - minutes
+      - hours
+      - weeks
+  TimeDuration:
+    Type: String
+    Description: Numeric value indicating how many (days, minutes, hours, etc.) to retain snapshots and backups
+
+Resources:
+  SFNTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SnapshotMgmt-SFNTrigger
+      MemorySize: 128
+      Timeout: 900
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      Handler: lambda_function.lambda_handler
+      Description: StepFunction Trigger Function
+      KmsKeyArn: !Ref LambdaKmsKeyArn
+      Environment:
+        Variables:
+          EBSResourceTypeTag: ResourceType
+          EBSResourceTypeValue: SnapshotMgmtTarget
+          FSxResourceTypeTag: ResourceType
+          FSxResourceTypeValue: SnapshotMgmtTarget
+          StepFunctionArn: !Ref StepFunction
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Sub '${SFNTriggerLambdaZipKey}'
+
+  SFNTriggerLambdaEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SnapshotMgmt-ScheduleTrigger
+      ScheduleExpression: cron(0 16,20 ? * 2-6 *)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt SFNTriggerLambda.Arn
+          Id: !Ref SFNTriggerLambda
+
+  SnapManagementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SnapshotMgmt
+      MemorySize: 128
+      Timeout: 900
+      Runtime: python3.8
+      Role: !GetAtt LambdaRole.Arn
+      Handler: lambda_function.lambda_handler
+      Description: Snapshot Management Function
+      KmsKeyArn: !Ref LambdaKmsKeyArn
+      Environment:
+        Variables:
+          EBSSnapshotDocumentSSMParameter: !Ref EBSVolumeSnapshotSSMDocumentNameParameter
+          TimeDurationType: !Ref TimeDurationType
+          TimeDuration: !Ref TimeDuration
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Sub '${SnapshotManagementLambdaZipKey}'
+
+  SFNTriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SFNTriggerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SFNTriggerLambdaEventRule.Arn
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SnapshotManagement-Lambda
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SnapshotManagement
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSnapshots
+                  - ec2:DeleteSnapshot
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ssm:GetAutomationExecution
+                  - ssm:DescribeAutomationExecutions
+                  - ssm:ListCommands
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommandInvocations
+                  - ssm:GetParameter
+                  - fsx:DescribeFileSystems
+                  - fsx:CreateBackup
+                  - fsx:DescribeBackups
+                  - fsx:DeleteBackup
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:*:*:stateMachine:${SnapManagementSFNName}'
+                  - !Sub
+                      - arn:aws:ssm:*:*:automation-definition/${SSM_Doc_Name}:$DEFAULT
+                      - {SSM_Doc_Name: !GetAtt EBSVolumeSnapshotSSMDocumentNameParameter.Value}
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - arn:aws:ssm:*:*:document/AWS-RunPowerShellScript
+                  - arn:aws:ssm:*:*:document/AWS-ConfigureAWSPackage
+                  - arn:aws:ec2:*:*:instance/*
+                  - arn:aws:ssm:*:*:managed-instance/*
+
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref SnapManagementSFNName
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "EBS Snapshot and FSx Backup Management",
+          "StartAt": "ProcessEBSAndFSx",
+          "States": {
+            "ProcessEBSAndFSx": {
+              "Type": "Parallel",
+              "End": true,
+              "Branches": [
+                {
+                  "StartAt": "ProcessFSxFileSystems",
+                  "States": {
+                    "ProcessFSxFileSystems": {
+                      "Type": "Map",
+                      "End": true,
+                      "MaxConcurrency": 0,
+                      "ItemsPath": "$.FSxFileSystems",
+                      "Iterator": {
+                        "StartAt": "CheckBackupInProgress",
+                        "States": {
+                          "CheckBackupInProgress": {
+                            "Type": "Task",
+                            "Next": "ContinueExecution",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "FileSystemId.$": "$.FileSystemId",
+                                "Tags.$": "$.Tags",
+                                "EventType": "CheckBackupInProgress",
+                                "AttemptCount.$": "$.AttemptCount"
+                              }
+                            }
+                          },
+                          "ContinueExecution": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "And": [
+                                  {
+                                    "Variable": "$.Payload.BackupInProgress",
+                                    "BooleanEquals": true
+                                  },
+                                  {
+                                    "Variable": "$.Payload.AttemptCount",
+                                    "NumericLessThan": 30
+                                  }
+                                ],
+                                "Next": "Wait"
+                              },
+                              {
+                                "And": [
+                                  {
+                                    "Variable": "$.Payload.BackupInProgress",
+                                    "BooleanEquals": true
+                                  },
+                                  {
+                                    "Variable": "$.Payload.AttemptCount",
+                                    "NumericGreaterThanEquals": 30
+                                  }
+                                ],
+                                "Next": "BackupTimeout"
+                              }
+                            ],
+                            "Default": "BackupFSxFileSystem"
+                          },
+                          "Wait": {
+                            "Type": "Wait",
+                            "Seconds": 60,
+                            "OutputPath": "$.Payload",
+                            "Next": "CheckBackupInProgress"
+                          },
+                          "BackupFSxFileSystem": {
+                            "Type": "Task",
+                            "Next": "CleanupFSxBackups",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "FileSystemId.$": "$.Payload.FileSystemId",
+                                "Tags.$": "$.Payload.Tags",
+                                "EventType": "FSxBackup",
+                                "AttemptCount.$": "$.Payload.AttemptCount"
+                              }
+                            }
+                          },
+                          "BackupTimeout": {
+                            "Type": "Fail"
+                          },
+                          "CleanupFSxBackups": {
+                            "Type": "Task",
+                            "End": true,
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "FileSystemId.$": "$.Payload.FileSystemId",
+                                "Tags.$": "$.Payload.Tags",
+                                "EventType": "CleanupFSxBackups"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "StartAt": "ProcessEc2Instances",
+                  "States": {
+                    "ProcessEc2Instances": {
+                      "Type": "Map",
+                      "End": true,
+                      "MaxConcurrency": 0,
+                      "ItemsPath": "$.Ec2Instances",
+                      "Iterator": {
+                        "StartAt": "SnapshotEbsVolumes",
+                        "States": {
+                          "SnapshotEbsVolumes": {
+                            "Type": "Task",
+                            "Next": "GetExecutionStatus",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "EventType": "EBSSnapshot",
+                                "InstanceId.$": "$.InstanceId",
+                                "Tags.$": "$.Tags",
+                                "AttemptCount.$": "$.AttemptCount"
+                              }
+                            }
+                          },
+                          "RetryEbsSnapshot": {
+                            "Type": "Pass",
+                            "OutputPath": "$.Payload.EBSSnapshotEvent",
+                            "Next": "SnapshotEbsVolumes"
+                          },
+                          "GetExecutionStatus": {
+                            "Type": "Task",
+                            "Next": "ExecutionStatus",
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "ExecutionData.$": "$.Payload",
+                                "EventType": "AutomationExecutionStatus"
+                              }
+                            },
+                            "ResultSelector": {
+                              "Payload.$": "$.Payload.ExecutionData"
+                            },
+                            "ResultPath": "$.TaskResult",
+                            "OutputPath": "$.TaskResult"
+                          },
+                          "ExecutionStatus": {
+                            "Type": "Choice",
+                            "Choices": [
+                              {
+                                "Variable": "$.Payload.Status",
+                                "StringEquals": "Success",
+                                "Next": "Success"
+                              },
+                              {
+                                "Variable": "$.Payload.Status",
+                                "StringEquals": "InProgress",
+                                "Next": "InProgress"
+                              },
+                              {
+                                "And": [
+                                  {
+                                    "Variable": "$.Payload.Status",
+                                    "StringEquals": "Failed"
+                                  },
+                                  {
+                                    "Variable": "$.Payload.EBSSnapshotEvent.AttemptCount",
+                                    "NumericLessThan": 5
+                                  }
+                                ],
+                                "Next": "RetryEbsSnapshot"
+                              },
+                              {
+                                "And": [
+                                  {
+                                    "Variable": "$.Payload.Status",
+                                    "StringEquals": "Failed"
+                                  },
+                                  {
+                                    "Variable": "$.Payload.EBSSnapshotEvent.AttemptCount",
+                                    "NumericGreaterThanEquals": 5
+                                  }
+                                ],
+                                "Next": "Failed"
+                              }
+                            ],
+                            "Default": "Failed"
+                          },
+                          "Success": {
+                            "Type": "Pass",
+                            "Next": "CleanupOldSnapshots"
+                          },
+                          "InProgress": {
+                            "Type": "Wait",
+                            "Seconds": 40,
+                            "Next": "GetExecutionStatus"
+                          },
+                          "Failed": {
+                            "Type": "Fail"
+                          },
+                          "CleanupOldSnapshots": {
+                            "Type": "Task",
+                            "End": true,
+                            "Resource": "arn:aws:states:::lambda:invoke",
+                            "Parameters": {
+                              "FunctionName": "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:SnapshotMgmt:$LATEST",
+                              "Payload": {
+                                "InstanceId.$": "$.Payload.InstanceId",
+                                "EventType": "CleanupEbsSnapshots"
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SnapshotManagement-SFN
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SnapshotManagement
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery,
+                  - logs:GetLogDelivery,
+                  - logs:UpdateLogDelivery,
+                  - logs:DeleteLogDelivery,
+                  - logs:ListLogDeliveries,
+                  - logs:PutResourcePolicy,
+                  - logs:DescribeResourcePolicies,
+                  - logs:DescribeLogGroups,
+                  - xray:PutTraceSegments,
+                  - xray:PutTelemetryRecords,
+                  - xray:GetSamplingRules,
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${SnapManagementLambda}:$LATEST'
+
+  EBSVolumeSnapshotDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        description: Create EBS Volume Snapshots
+        schemaVersion: '0.3'
+        parameters:
+          InstanceId:
+            type: String
+          SnapshotName:
+            type: String
+          SnapshotRequestId:
+            type: String
+        outputs:
+          - CheckIfVssComponentsAreInstalled.Output
+        mainSteps:
+          - name: CheckIfVssComponentsAreInstalled
+            action: 'aws:runCommand'
+            timeoutSeconds: 600
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                commands: |-
+                  $result = Invoke-Command -ScriptBlock {vssadmin list providers}
+                  foreach ($line in $result) {
+                      if ($line.ToString().Contains('EC2 VSS Software Provider')) {
+                          Write-Host -NoNewline 'AwsVssComponentsInstalled'
+                      }
+                  }
+          - name: DecisionBranch
+            action: 'aws:branch'
+            inputs:
+              Choices:
+                - NextStep: PreSnapshotExecution 
+                  Variable: '{{CheckIfVssComponentsAreInstalled.Output}}'
+                  StringEquals: 'AwsVssComponentsInstalled'
+              Default: InstallAwsVssComponents
+          - name: InstallAwsVssComponents
+            action: 'aws:runCommand'
+            timeoutSeconds: 600
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-ConfigureAWSPackage
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                action: Install
+                name: AwsVssComponents
+          - name: PreSnapshotExecution
+            action: 'aws:runCommand'
+            timeoutSeconds: 600
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                commands: |-
+                  $ErrorActionPreference="Stop"
+                  Write-Host "Performing Pre Snapshot Process"
+                  Write-Host "Place your code here."
+          - name: CreateEBSVolumeSnapshots
+            action: 'aws:runCommand'
+            timeoutSeconds: 600
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                commands: |-
+                  # Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.#
+                  $ErrorActionPreference="Stop"
+                  Import-module AwsPowerShell
+
+                  #
+                  # Freezes All EBS volumes attached to an Ec2 instance except root volume
+                  #
+                  function Freeze-Instance {
+                      param(
+                          [string]$InstanceId,
+                          [string[]]$Devices,
+                          [string[]]$Volumes
+                      )
+                      $DevicesString = $Devices -join ','
+                      $VolumesString = $Volumes -join ','
+                      Write-Host "Starting Freeze for devices" $DevicesString $(Get-Date)
+                      # Call freeze SSM command and wait until complete
+                      $cmd = Send-SSMCommand -InstanceId $InstanceId -DocumentName AWSEC2-ManageVssIO -Parameter @{"Action" = "Freeze"; "Devices" = $DevicesString; "Volumes" = $VolumesString}
+                      $commandId = $cmd.CommandId
+                      Sleep -Seconds 2
+                      while ((Get-SSMCommandInvocation -CommandId $commandId).Status.Value -eq "InProgress" ) {
+                          Sleep -MilliSeconds 501
+                      }
+                      $CommandInvocation = Get-SSMCommandInvocation -CommandId $commandId -Details $true
+                      if ($CommandInvocation.CommandPlugins[0].Status.Value -eq "Failed") {
+                          throw  "Freeze command failed, command id: $($commandId), output: $($CommandInvocation.CommandPlugins[0].Output)"
+                      }
+                      Write-Host "Freeze complete, command id=$commandId $(Get-Date)"
+                  }
+
+                  #
+                  # Thaws EBS volumes attached to an Ec2 instance
+                  #
+                  function Thaw-Instance {
+                      param([string]$InstanceId)
+
+                      Write-Host "Starting Thaw $(Get-Date)"
+                      #Call thaw SSM command and wait until complete
+                      $cmd = Send-SSMCommand -InstanceId $InstanceId -DocumentName AWSEC2-ManageVssIO -Parameter @{"Action" = "Thaw"}
+                      $commandId = $cmd.CommandId
+                      Sleep -Seconds 1
+                      while ((Get-SSMCommandInvocation -CommandId $commandId).Status.Value -eq "InProgress" ) {
+                          Sleep -Seconds 1
+                      }
+                      Write-Host "Thaw complete, command id=$commandId $(Get-Date)"
+                      $CommandInvocation = Get-SSMCommandInvocation -CommandId $commandId -Details $true
+                      if ($CommandInvocation.CommandPlugins[0].Status.Value -eq "Failed") {
+
+                          throw "Thaw command failed $($commandId), output $CommandInvocation.CommandPlugins[0].Status"
+                      }
+
+                      $output = $CommandInvocation.CommandPlugins[0].Output
+                      $Status = $CommandInvocation.CommandPlugins[0].Status
+                      write-host $output
+                  }
+
+                  #
+                  # Tag Snapshots
+                  #
+                  function Tag-Snapshots {
+                      param(
+                          [System.Object[]]$SnapshotsData,
+                          [boolean]$AppConsistent,
+                          [Parameter(Mandatory = $false)][amazon.EC2.Model.Tag[]]$Tags
+                      )
+                      if ($Tags -eq $null) {
+                          $Tags = @()
+                      }
+                      $Tag = new-object amazon.EC2.Model.Tag
+                      $Tag.Key = "AppConsistent"
+                      $Tag.Value = "$AppConsistent"
+                      $Tags += $Tag
+                      foreach ($SnapshotData in $SnapshotsData) {
+                          $Tag = new-object amazon.EC2.Model.Tag
+                          $Tag.Key = "DiskDeviceName"
+                          $Tag.Value = $SnapshotData.Device
+                          $AllTags = $Tags + $Tag
+                          New-EC2Tag -Resources $SnapshotData.SnapshotId -Tags $AllTags
+                      }
+                  }
+
+                  #
+                  # Create consistent snapshots of volumes attached to an EC2 instance except root volume
+                  #
+                  function Vss-Snapshot {
+                      param(
+                          [string]$InstanceId,
+                          [Parameter(Mandatory = $false)][string]$Description,
+                          [Parameter(Mandatory = $false)][amazon.EC2.Model.Tag[]]$Tags
+                      )
+
+                      #Get attached volumes/devices
+                      $BlockDeviceMappings = (Get-EC2Instance -Instance $InstanceId).Instances.BlockDeviceMappings
+                      $SnapshotData = @()
+                      foreach ($BlockDeviceMapping in $BlockDeviceMappings) {
+                          #Exclude the boot volume, boot volumes are not supported using this script
+                          if ($BlockDeviceMapping.DeviceName -ne "/dev/sda1") {
+                              $SnapshotData +=
+                              New-Object PSObject -Property @{
+                                  EbsVolumeId = $BlockDeviceMapping.Ebs.VolumeId
+                                  Device      = $BlockDeviceMapping.DeviceName
+                                  SnapshotId  = $null
+                              }
+                          }
+                      }
+                      if ($SnapshotData.Count -eq 0) {
+                          Write-Error "Instance has no volumes to snapshot"
+                          exit 1
+                      }
+
+                      #Freeze IO on instance
+                      Freeze-Instance $InstanceId $SnapshotData.Device $SnapshotData.EbsVolumeId
+
+                      #Take Snapshots
+                      foreach ($Data in $SnapshotData) {
+                          $Snaphsot = New-EC2Snapshot -Description $Description -VolumeId $Data.EbsVolumeId
+                          $Data.SnapshotId = $Snaphsot.SnapshotId
+                      }
+
+                      #Thaw IO on instance
+                      Try {
+                          Thaw-Instance $InstanceId
+                          Tag-Snapshots $SnapshotData $true $Tags
+                      } Catch {
+                          #If Thaw fails (snapshots took to long), tag snapshots as AppConsistent=false
+                          Tag-Snapshots $SnapshotData $false $Tags
+                      }
+                  }
+
+                  #Example usage -- Update the tags as needed
+                  $Tags = @()
+                  $Tag = new-object amazon.EC2.Model.Tag
+                  $Tag.Key = "Name"
+                  $Tag.Value = '{{ SnapshotName }}'
+                  $Tags += $Tag
+                  $Tag = new-object amazon.EC2.Model.Tag
+                  $Tag.Key = "SnapshotRequestId"
+                  $Tag.Value = '{{ SnapshotRequestId }}'
+                  $Tags += $Tag
+                  $Tag = new-object amazon.EC2.Model.Tag
+                  $Tag.Key = "CreatedBy"
+                  $Tag.Value = 'Snapshot-Automation-Sample'
+                  $Tags += $Tag
+                  $Tag = new-object amazon.EC2.Model.Tag
+                  $Tag.Key = "Ec2InstanceId"
+                  $Tag.Value = '{{ InstanceId }}'
+                  $Tags += $Tag
+
+                  $SnapshotName = '{{ SnapshotName }}'
+                  $InstanceId = '{{ InstanceId }}'
+
+                  # Vss-Snapshot "<Instance-id>" "<Description>"  $Tags
+                  Vss-Snapshot "$InstanceId" "Snapshot-Automation-Sample"  $Tags
+          - name: PostSnapshotExecution
+            action: 'aws:runCommand'
+            timeoutSeconds: 600
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ InstanceId }}'
+              Parameters:
+                commands: |-
+                  $ErrorActionPreference="Stop"
+                  Write-Host "Performing Post Snapshot Process"
+                  Write-Host "Place your code here."
+
+  EBSVolumeSnapshotSSMDocumentNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      DataType: text
+      Description: Name of the EBS Snapshot SSM Automation Document
+      Name: /snapshot-mgmt/ssm/ebs-volume-snapshot-document
+      Type: String
+      Value: !Ref EBSVolumeSnapshotDocument

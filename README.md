@@ -1,4 +1,12 @@
 ## FSx Backup and EBS Snapshot Management
+### Table of Contents
+* [Overview](#Overview)
+* [Prerequisites](#Prerequisites)
+* [Workflow](#Workflow)
+* [Deployment](#Deployment)
+* [UsageNotes](#UsageNotes)
+* [Security](#Security)
+* [License](#License)
 --------------------------------------------------------------------
 ### Overview
 This sample code will illustrate the use of several AWS services to build a simple data backup solution based upon FSx Windows FileSystem backups and EC2 EBS volume snapshots. It is geared toward Windows based environments, however the concepts could be adapted for other use-cases. The intent is as a data backup solution and not as a host level operating system backup solution. The solution is a combination of Cloudformation, Lambda, Step Function, Python, and Windows Powershell code.
@@ -14,6 +22,8 @@ The following items are required to deploy this solution for testing and evaluat
 * One or more EC2 instances with additional EBS volumes attached. The EC2 instances need to have the tag below. This tag is used to locate the EC2 instances that should have snapshots created of their EBS volumes
   - Tag Key: 'ResourceType'
   - Tag Value: 'SnapshotMgmtTarget'
+* EC2 instance profile attached to your EC2 instances with the required permission to allow management via Aws Systems Manager and the ability to execute SSM commands and documents, create EBS snapshots and tags. A sample [Cloudformation template](cloudformation/iam/ec2-profile-and-role.yaml) that will create an IAM role and EC2 instance profile with the required permissions can be found at:
+  - 'cloudformation/iam/ec2-profile-and-role.yaml'
 * One or more Windows FSx file systems. The file systems need to have the tag below. This tag is used to locate the file systems that should have backups created by this solution.
   - Tag Key: 'ResourceType'
   - Tag Value: 'SnapshotMgmtTarget'
@@ -40,8 +50,33 @@ The following items are required to deploy this solution for testing and evaluat
      4. The 'CleanupOldSnapshots' step will search for EBS volume snapshots tagged with the EC2 instance ID, determining if the snapshots are older than the defined retention period and deleting them.
 
 <p align="center">
-  <img src="resources/workflow.png" width="650" title="hover text">
+  <img src="resources/workflow.png" width="750" title="hover text">
 </p>
+
+## Deployment
+1. Zip the Lambda function code.
+   1. Zip the file 'lambda/sfn-trigger/lambda_function.py' into a zip file named 'sfn-trigger.zip'
+   2. Zip the file 'lambda/snap-manager/lambda_function.py' into a zip file named 'snap-manager.zip'
+2. Upload the Lambda zip files to an S3 bucket
+3. Deploy the Snapshot Management Cloudformation template.
+   1. Open the Cloudformation management console and select the Cloudformation template:
+      1. 'cloudformation/snapshot-management.yaml'
+   2. Provide the values for the following Cloudformation parameters:
+      1. **Stack name:** The Cloudformation Stack name
+      2. **S3Bucket:** An S3 bucket name. This should be the S3 bucket where you have uploaded the Lambda zip files.
+      3. **SFNTriggerLambdaZipKey:** The S3 object path (key) for the 'sfn-trigger.zip' file
+      4. **SnapshotManagementLambdaZipKey:** The S3 object path (key) for the 'snap-manager.zip' file
+      5. **LambdaKmsKeyArn:** The ARN of the Kms Key that will be used to encrypt the Lambda function environment variables. You may use your own Customer managed key or the AWS managed key for Lambda
+      6. **TimeDurationType:** A time duration type value which is used to determine the retention period for the EBS snapshots and FSx backups. Valid values are: (days, seconds, microseconds, milliseconds, minutes, hours, weeks)
+      7. **TimeDuration:** A numeric value indicating the lenth of the retention period for the EBS snapshots and FSx backups. For example, how many (days, hours, minutes, etc.) to retain the snapshots and backups for.
+
+## Usage Notes
+* The Amazon EventBridge rule which invokes the SnapshotMgmt-SFNTrigger lambda function based upon a schedule is deployed as part of the solution in a 'DISABLED' state. You may either manually 'ENABLE' it after deployment, or modify the 'State' property of the 'SFNTriggerLambdaEventRule' resource in the 'snapshot-management.yaml' Cloudformation template.
+* If you would like to change the tag key and value that are used to locate the FSx file systems and EC2 instances, those are specified as 'Environment' > 'Variables' properties on the 'SFNTriggerLambda' resource in the 'snapshot-management.yaml' Cloudformation template.
+* If you need to perform any Pre or Post steps prior to creating the EBS volume snapshots, there are placeholder steps in the SSM automation document named 'PreSnapshotExecution' and 'PostSnapshotExecution'. You may insert your custom code in these SSM document steps. The Cloudformation resource name for the SSM automation document is 'EBSVolumeSnapshotDocument' in the 'snapshot-managmement.yaml' Cloudformation template.
+* By default the operating system EBS volume is excluded from the EBS snapshot process. If you wish to exclude addtional volumes you may modify the code in the SSM automation document 'Vss-Snapshot' function with conditional logic to include additional 'DeviceName' values.
+* An attempt is made to create the EBS volume snapshots as 'application-consistent' snapshots, if this is successful the snapshots will have a tag of 'AppConsistent=True'. You can read more about this process in the EC2 documentation.
+  - https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/application-consistent-snapshots.html
 
 ## Security
 
