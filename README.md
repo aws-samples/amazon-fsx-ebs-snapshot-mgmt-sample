@@ -5,6 +5,7 @@
 * [Workflow](#Workflow)
 * [Deployment](#Deployment)
 * [UsageNotes](#UsageNotes)
+* [Troubleshooting](#Troubleshooting)
 * [Security](#Security)
 * [License](#License)
 --------------------------------------------------------------------
@@ -78,6 +79,10 @@ The following items are required to deploy this solution for testing and evaluat
 * An attempt is made to create the EBS volume snapshots as 'application-consistent' snapshots, if this is successful the snapshots will have a tag of 'AppConsistent=True'. You can read more about this process in the EC2 documentation.
   - https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/application-consistent-snapshots.html
 
+## Troubleshooting
+* When attempting to create an EBS volume snapshot using this solution, the volume must be online and initialized within the host operating systems or the snapshot process will fail
+* For additional troubleshooting steps you can refer to the documentation below.
+  - https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/application-consistent-snapshots-creating-commands.html#application-consistent-snapshots-troubleshooting
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
