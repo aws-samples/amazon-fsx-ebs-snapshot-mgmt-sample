@@ -19,7 +19,7 @@ AWSTemplateFormatVersion: 2010-09-09
 Description: >
   **WARNING**
   This template will create an EC2 instance profile and an associated IAM role which contain the permissions and
-  policies required for the snapshot managment sample code. For production used the EC2 and SSM resources should
+  policies required for the snapshot managment sample code. For production use the EC2 and SSM resources should
   be scoped down to just the instance ID that will have this EC2 profile attached.
 
 Resources:
