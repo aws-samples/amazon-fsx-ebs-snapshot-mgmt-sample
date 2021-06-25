@@ -55,9 +55,10 @@ The following items are required to deploy this solution for testing and evaluat
 </p>
 
 ## Deployment
-1. Zip the Lambda function code.
-   1. Zip the file 'lambda/sfn-trigger/lambda_function.py' into a zip file named 'sfn-trigger.zip'
-   2. Zip the file 'lambda/snap-manager/lambda_function.py' into a zip file named 'snap-manager.zip'
+1. Clone this repository to your laptop/desktop.
+2. Zip the Lambda function code.
+   1. Zip the file 'lambda/sfn-trigger/lambda_function.py' into a file named 'sfn-trigger.zip'
+   2. Zip the file 'lambda/snap-manager/lambda_function.py' into a file named 'snap-manager.zip'
 2. Upload the Lambda zip files to an S3 bucket
 3. Deploy the Snapshot Management Cloudformation template.
    1. Open the Cloudformation management console and select the Cloudformation template:
@@ -72,7 +73,7 @@ The following items are required to deploy this solution for testing and evaluat
       7. **TimeDuration:** A numeric value indicating the lenth of the retention period for the EBS snapshots and FSx backups. For example, how many (days, hours, minutes, etc.) to retain the snapshots and backups for.
 
 ## Usage Notes
-* The Amazon EventBridge rule which invokes the SnapshotMgmt-SFNTrigger lambda function based upon a schedule is deployed as part of the solution in a 'DISABLED' state. You may either manually 'ENABLE' it after deployment, or modify the 'State' property of the 'SFNTriggerLambdaEventRule' resource in the 'snapshot-management.yaml' Cloudformation template.
+* The Amazon EventBridge rule which invokes the SnapshotMgmt-SFNTrigger lambda function based upon a schedule is deployed as part of the solution in a 'DISABLED' state. You may either manually 'ENABLE' it after deployment, or modify the 'State' property of the 'SFNTriggerLambdaEventRule' resource in the 'snapshot-management.yaml' Cloudformation template. This is also where you would change the schedule if desired.
 * If you would like to change the tag key and value that are used to locate the FSx file systems and EC2 instances, those are specified as 'Environment' > 'Variables' properties on the 'SFNTriggerLambda' resource in the 'snapshot-management.yaml' Cloudformation template.
 * If you need to perform any Pre or Post steps prior to creating the EBS volume snapshots, there are placeholder steps in the SSM automation document named 'PreSnapshotExecution' and 'PostSnapshotExecution'. You may insert your custom code in these SSM document steps. The Cloudformation resource name for the SSM automation document is 'EBSVolumeSnapshotDocument' in the 'snapshot-managmement.yaml' Cloudformation template.
 * By default the operating system EBS volume is excluded from the EBS snapshot process. If you wish to exclude addtional volumes you may modify the code in the SSM automation document 'Vss-Snapshot' function with conditional logic to include additional 'DeviceName' values.
